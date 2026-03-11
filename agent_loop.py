@@ -11,29 +11,30 @@ from tool_shell import PowerShellTool
 
 
 SYSTEM_PROMPT = """You are a constrained coding agent operating through a browser chat.
-You must respond with raw JSON only. Do not use Markdown. Do not wrap JSON in code fences.
-You have exactly one action per response.
+You must output exactly one JSON action per response.
 
 Allowed actions:
 1. {"action":"list_dir","path":"relative/path"}
-2. {"action":"read_file","path":"relative/path","start_line":1,"end_line":200}
-3. {"action":"edit_file","path":"relative/path","old_text":"exact old text","new_text":"replacement text"}
-4. {"action":"run_shell","command":"Read-only shell command"}
-5. {"action":"final","message":"answer to the user"}
+2. {"action":"read_file","path":"relative/path"}
+3. {"action":"run_shell","command":"Read-only shell command"}
+4. {"action":"final","message":"answer to the user"}
+
+5. edit_file is SPECIAL. To avoid JSON escaping issues with multi-line code, output the JSON with ONLY the path, start_line, and end_line. Then put the replacement code OUTSIDE the JSON in a standard Markdown code block:
+{"action":"edit_file","path":"main.py","start_line":10,"end_line":15}
+```python
+replacement text here
+```
 
 Rules:
 - Stay inside the current workspace.
 - Use relative paths only.
 - Prefer one small safe step at a time.
-- For edit_file, old_text must match exactly once in the file.
-- For edit_file, old_text and new_text must be valid JSON strings.
-- Escape all inner double quotes inside old_text and new_text as \".
-- Example valid edit_file JSON: {"action":"edit_file","path":"main.py","old_text":"print(\"hello\")","new_text":"print(\"hello world\")"}
+- read_file returns the entire file with line numbers. Use these exact line numbers for edit_file.
+- For edit_file, start_line and end_line are inclusive (1-based). To insert without deleting, use start_line = N, end_line = N-1.
 - File changes are allowed only through edit_file.
 - run_shell is read-only only. Prefer dir, type, rg, git status, git diff, git log, git show, git branch, git rev-parse.
 - Never use python, py, powershell, pwsh, cmd, base64, redirection, pipes, or shell chaining.
 - Do not ask to use tools you do not have.
-- Do not output explanations outside the JSON object.
 - When enough information is gathered, return final.
 """
 
@@ -122,13 +123,14 @@ class AgentLoop:
 
     def _build_repair_prompt(self, error_message: str, raw_response: str) -> str:
         return (
-            "Your last response was invalid.\n"
+            "Your last response was INVALID.\n"
             f"Error: {error_message}\n"
             f"Raw response:\n{raw_response}\n\n"
-            "Reminder: return strict JSON only.\n"
-            "If old_text or new_text contains code like print(\"...\"), escape inner double quotes as \\\" inside the JSON string.\n"
-            "Do not use unescaped double quotes inside JSON string values.\n\n"
-            "Return exactly one valid JSON action and nothing else."
+            "*** CRITICAL FIX REQUIRED ***\n"
+            "If you are trying to use edit_file, output the JSON with start_line and end_line, then use a Markdown code block outside the JSON. Example:\n"
+            "{\"action\":\"edit_file\", \"path\":\"main.py\", \"start_line\": 10, \"end_line\": 12}\n"
+            "```python\nprint(\"New\")\n```\n\n"
+            "Return exactly one valid action."
         )
 
     def _build_tool_result_prompt(self, action: AgentAction, result: dict[str, Any]) -> str:
@@ -147,14 +149,8 @@ class AgentLoop:
             return self.fs_tools.list_dir(str(action.payload.get("path", ".")))
 
         if action.action == "read_file":
-            self._log(
-                f"dispatch read_file path={action.payload['path']} start={int(action.payload.get('start_line', 1))} end={int(action.payload.get('end_line', 200))}"
-            )
-            return self.fs_tools.read_file(
-                relative_path=str(action.payload["path"]),
-                start_line=int(action.payload.get("start_line", 1)),
-                end_line=int(action.payload.get("end_line", 200)),
-            )
+            self._log(f"dispatch read_file path={action.payload['path']}")
+            return self.fs_tools.read_file(str(action.payload["path"]))
 
         if action.action == "run_shell":
             self._log(f"dispatch run_shell command={action.payload['command']}")
@@ -162,21 +158,20 @@ class AgentLoop:
 
         if action.action == "edit_file":
             path = str(action.payload["path"])
-            old_text = str(action.payload.get("old_text", ""))
+            start_line = int(action.payload.get("start_line", 1))
+            end_line = int(action.payload.get("end_line", start_line))
             new_text = str(action.payload.get("new_text", ""))
-            preview = self.fs_tools.preview_patch(path, old_text, new_text)
-            if preview["match_start_line"] is not None:
-                self._log(
-                    f"dispatch edit_file path={path} target_lines={preview['match_start_line']}-{preview['match_end_line']} old_len={len(old_text)} new_len={len(new_text)}"
-                )
-            else:
-                self._log(f"dispatch edit_file path={path} new_file_create old_len={len(old_text)} new_len={len(new_text)}")
+            
+            preview = self.fs_tools.preview_patch(path, start_line, end_line, new_text)
+            self._log(
+                f"dispatch edit_file path={path} target_lines={start_line}-{end_line} new_len={len(new_text)}"
+            )
             self.output_fn("\n--- diff preview ---")
             self.output_fn(preview["diff"] or "(no changes)")
             answer = self.input_fn("Apply this patch? [y/N]: ").strip().lower()
             if answer != "y":
                 return {"path": path, "applied": False, "reason": "user_rejected"}
-            applied = self.fs_tools.apply_patch(path, old_text, new_text)
+            applied = self.fs_tools.apply_patch(path, start_line, end_line, new_text)
             return {"path": path, "applied": True, "diff": applied["diff"]}
 
         raise ValueError(f"Unsupported action: {action.action}")
@@ -191,6 +186,16 @@ class AgentLoop:
         action = payload.get("action")
         if action not in {"list_dir", "read_file", "edit_file", "run_shell", "final"}:
             raise ValueError("Response contains an unknown action.")
+            
+        if action == "edit_file":
+            new_text_match = re.search(r"```(?:python|py|txt|json|html|css|js|ts)?\n?(.*?)\n?```", response_text[len(json_text):], re.DOTALL)
+            if new_text_match:
+                payload["new_text"] = new_text_match.group(1)
+            elif "new_text" not in payload:
+                raise ValueError("edit_file requires a Markdown code block outside the JSON.")
+            if "start_line" not in payload or "end_line" not in payload:
+                raise ValueError("edit_file requires start_line and end_line in JSON.")
+
         return AgentAction(action=action, payload=payload)
 
     def _extract_json_object(self, text: str) -> str:

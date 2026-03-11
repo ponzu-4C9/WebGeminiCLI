@@ -37,48 +37,48 @@ class FileSystemTools:
 
         return {"path": relative_path, "entries": entries}
 
-    def read_file(self, relative_path: str, start_line: int = 1, end_line: int = 200) -> dict[str, Any]:
-        if start_line < 1 or end_line < start_line:
-            raise ValueError("Invalid line range.")
-
+    def read_file(self, relative_path: str) -> dict[str, Any]:
         file_path = self._resolve_path(relative_path)
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {relative_path}")
         if not file_path.is_file():
             raise IsADirectoryError(f"Not a file: {relative_path}")
 
-        lines = file_path.read_text(encoding="utf-8").splitlines()
-        selected = lines[start_line - 1:end_line]
+        content = file_path.read_text(encoding="utf-8")
+        lines = content.splitlines()
+        numbered_lines = [f"{i+1:4d} | {line}" for i, line in enumerate(lines)]
+
         return {
             "path": relative_path,
-            "start_line": start_line,
-            "end_line": min(end_line, len(lines)),
             "line_count": len(lines),
-            "content": "\n".join(selected),
+            "content": "\n".join(numbered_lines),
         }
 
-    def preview_patch(self, relative_path: str, old_text: str, new_text: str) -> dict[str, Any]:
+    def preview_patch(self, relative_path: str, start_line: int, end_line: int, new_text: str) -> dict[str, Any]:
         file_path = self._resolve_path(relative_path)
-        match_start_line = None
-        match_end_line = None
-
+        
         if file_path.exists():
             if not file_path.is_file():
                 raise IsADirectoryError(f"Not a file: {relative_path}")
             before_content = file_path.read_text(encoding="utf-8")
-            if old_text not in before_content:
-                raise ValueError("old_text was not found in the target file.")
-            occurrences = before_content.count(old_text)
-            if occurrences != 1:
-                raise ValueError(f"old_text must match exactly once. Found {occurrences} matches.")
-            match_index = before_content.index(old_text)
-            match_start_line = before_content[:match_index].count("\n") + 1
-            match_end_line = match_start_line + old_text.count("\n")
-            after_content = before_content.replace(old_text, new_text, 1)
         else:
-            if old_text:
-                raise FileNotFoundError("Target file does not exist and old_text is not empty.")
             before_content = ""
+
+        lines = before_content.splitlines()
+        
+        start_idx = max(0, start_line - 1)
+        end_idx = max(0, min(len(lines), end_line))
+        
+        before_lines = lines[:start_idx]
+        after_lines = lines[end_idx:]
+        
+        new_lines = new_text.splitlines() if new_text else []
+        
+        final_lines = before_lines + new_lines + after_lines
+        after_content = "\n".join(final_lines)
+        if final_lines and before_content.endswith("\n"):
+            after_content += "\n"
+        elif not final_lines and new_text:
             after_content = new_text
 
         diff_lines = difflib.unified_diff(
@@ -93,12 +93,12 @@ class FileSystemTools:
             "path": relative_path,
             "diff": "\n".join(diff_lines),
             "new_content": after_content,
-            "match_start_line": match_start_line,
-            "match_end_line": match_end_line,
+            "match_start_line": start_line,
+            "match_end_line": end_line,
         }
 
-    def apply_patch(self, relative_path: str, old_text: str, new_text: str) -> dict[str, Any]:
-        preview = self.preview_patch(relative_path, old_text, new_text)
+    def apply_patch(self, relative_path: str, start_line: int, end_line: int, new_text: str) -> dict[str, Any]:
+        preview = self.preview_patch(relative_path, start_line, end_line, new_text)
         file_path = self._resolve_path(relative_path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(preview["new_content"], encoding="utf-8")

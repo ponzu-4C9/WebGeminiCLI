@@ -9,7 +9,7 @@ from tool_shell import PowerShellTool
 
 
 def read_user_request() -> str:
-    print("Enter your request. Finish with EOF on its own line.")
+    print("リクエストを入力してください。終了するには、単独の行に EOF と入力してください。")
     lines = []
     while True:
         try:
@@ -30,16 +30,16 @@ def main() -> None:
     loop = AgentLoop(client=client, fs_tools=fs_tools, shell_tool=shell_tool)
 
     try:
-        print("[startup] main: client.connect start")
+        print("[起動] main: client.connect 開始")
         client.connect()
-        print("[startup] main: client.connect done")
-        print("If the current Gemini chat has old context, open a fresh chat in the browser first.")
-        input("Press Enter when the browser is ready...")
+        print("[起動] main: client.connect 完了")
+        print("現在のGeminiチャットに古いコンテキストがある場合は、まずブラウザで新しいチャットを開いてください。")
+        input("ブラウザの準備ができたら Enter キーを押してください...")
         ready_message = loop.bootstrap()
-        print(f"Agent bootstrap response: {ready_message}")
+        print(f"エージェントの起動レスポンス: {ready_message}")
 
         while True:
-            print("\nCommands: /exit to quit")
+            print("\nコマンド: 終了するには /exit と入力してください")
             request = read_user_request()
             if not request:
                 continue
@@ -47,10 +47,10 @@ def main() -> None:
                 break
 
             final_message = loop.run(request)
-            print("\n=== Final Answer ===")
+            print("\n=== 最終回答 ===")
             print(final_message)
     finally:
-        answer = input("\nClose the browser? [Y/n]: ").strip().lower()
+        answer = input("\nブラウザを閉じますか？ [Y/n]: ").strip().lower()
         if answer not in {"n", "no"}:
             client.close()
 
