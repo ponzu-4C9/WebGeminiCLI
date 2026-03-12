@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import traceback
 
 from agent_loop import AgentLoop
 from gemini_web import GeminiWebClient
@@ -49,6 +50,12 @@ def main() -> None:
             final_message = loop.run(request)
             print("\n=== 最終回答 ===")
             print(final_message)
+    except KeyboardInterrupt:
+        print("\n中断されました。")
+        traceback.print_exc()
+    except Exception:
+        print("\n未処理例外が発生しました。")
+        traceback.print_exc()
     finally:
         answer = input("\nブラウザを閉じますか？ [Y/n]: ").strip().lower()
         if answer not in {"n", "no"}:

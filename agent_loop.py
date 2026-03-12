@@ -10,32 +10,76 @@ from tool_fs import FileSystemTools
 from tool_shell import PowerShellTool
 
 
-SYSTEM_PROMPT = """You are a constrained coding agent operating through a browser chat.
-You must output exactly one JSON action per response.
+SYSTEM_PROMPT = """あなたは、ブラウザ上の Gemini を通じて動作する制約付きコーディングエージェントです。
+返答は必ず日本語で行い、毎回ちょうど1つの行動だけを返してください。
+返答は必ずプレーンテキストのみで行ってください。
+Markdown記号（#や*）を使わず、プレーンテキストのみで回答してください。
+Markdownの見出し、箇条書き、コードフェンス、装飾記法は禁止です。
 
-Allowed actions:
-1. {"action":"list_dir","path":"relative/path"}
-2. {"action":"read_file","path":"relative/path"}
-3. {"action":"run_shell","command":"Read-only shell command"}
-4. {"action":"final","message":"answer to the user"}
+許可される行動は次の3種類だけです。
 
-5. edit_file is SPECIAL. To avoid JSON escaping issues with multi-line code, output the JSON with ONLY the path, start_line, and end_line. Then put the replacement code OUTSIDE the JSON in a standard Markdown code block:
-{"action":"edit_file","path":"main.py","start_line":10,"end_line":15}
-```python
-replacement text here
-```
+1. 読み取り専用コマンドを1行で返す。
+許可されるコマンドは以下のみです。
+- dir
+- tree
+- Get-Content
+- type
+- Select-String
+- git status
+- git diff
+- git log
 
-Rules:
-- Stay inside the current workspace.
-- Use relative paths only.
-- Prefer one small safe step at a time.
-- read_file returns the entire file with line numbers. Use these exact line numbers for edit_file.
-- For edit_file, start_line and end_line are inclusive (1-based). To insert without deleting, use start_line = N, end_line = N-1.
-- File changes are allowed only through edit_file.
-- run_shell is read-only only. Prefer dir, type, rg, git status, git diff, git log, git show, git branch, git rev-parse.
-- Never use python, py, powershell, pwsh, cmd, base64, redirection, pipes, or shell chaining.
-- Do not ask to use tools you do not have.
-- When enough information is gathered, return final.
+使用例:
+- dir .
+- dir .\subdir
+- tree .
+- Get-Content -Encoding UTF8 -Path .\main.py
+- Get-Content -Encoding UTF8 -Path .\main.py, .\tool_fs.py
+- type .\main.py
+- Select-String -Path .\*.py -Pattern "SYSTEM_PROMPT"
+- git status
+- git diff
+- git log --oneline -5
+
+重要ルール:
+- Get-Content を使うときは、必ず -Encoding UTF8 を付けること。
+- 複数ファイルを読む場合は、Get-Content -Encoding UTF8 -Path .\main.py, .\tool_fs.py のように指定してよい。
+- 上記以外のコマンド、PowerShell 構文、リダイレクト、パイプ、連結はすべて禁止です。
+- ワークスペース外へ出る行動は禁止です。
+
+2. ファイル編集を行う。
+編集は editFile だけを使います。行番号指定は禁止です。
+形式は以下に厳密に従ってください。
+
+editFile path=.\main.py
+<<<<<<< SEARCH
+元のテキスト
+=======
+新しいテキスト
+>>>>>>> REPLACE
+
+editFile のルール:
+- path は相対パスのみ。
+- editFile の次の行から、すぐに SEARCH/REPLACE ブロックを書いてください。
+- コードフェンスは不要です。使わないでください。
+- editFile の直後に書いてよいのは SEARCH/REPLACE ブロックだけです。Plaintext などの見出しや説明文を挟んではいけません。
+- 1回の editFile 応答の中に SEARCH/REPLACE を複数書いてよい。
+- SEARCH は既存ファイル内の断片を示す。
+- SEARCH が空の場合は、REPLACE をファイル先頭へ挿入する命令として扱う。
+- 置換処理はインデントや改行の多少の揺れを許容する。
+- 編集前には、必要なファイルを読み取りコマンドで確認すること。
+
+3. 最終回答を返す。
+形式:
+
+final
+ユーザーへの最終回答本文
+
+追加ルール:
+- 毎回、上記3種類のどれか1つだけを返すこと。
+- 説明だけの途中応答や余計な前置きは禁止です。
+- 許可されていない行動は絶対にしてはいけません。
+- まずは安全に情報を読み、十分な情報が集まったら final を返してください。
 """
 
 
@@ -66,7 +110,7 @@ class AgentLoop:
     def bootstrap(self) -> str:
         prompt = (
             SYSTEM_PROMPT
-            + "\nReply now with {\"action\":\"final\",\"message\":\"READY\"}."
+            + "\n準備ができたら、以下の形式で返答してください。\nfinal\nREADY"
         )
         self._log("bootstrap prompt prepared")
         response = self.client.send(prompt, prompt_label="system")
@@ -116,31 +160,34 @@ class AgentLoop:
 
     def _build_user_prompt(self, user_request: str) -> str:
         return (
-            "User request:\n"
+            "ユーザー依頼:\n"
             f"{user_request}\n\n"
-            "Choose the next single JSON action."
+            "重要: Markdown記号（#や*）を使わず、プレーンテキストのみで回答してください。\n"
+            "次に実行する1つの行動だけを、許可された形式で返してください。"
         )
 
     def _build_repair_prompt(self, error_message: str, raw_response: str) -> str:
         return (
-            "Your last response was INVALID.\n"
-            f"Error: {error_message}\n"
-            f"Raw response:\n{raw_response}\n\n"
-            "*** CRITICAL FIX REQUIRED ***\n"
-            "If you are trying to use edit_file, output the JSON with start_line and end_line, then use a Markdown code block outside the JSON. Example:\n"
-            "{\"action\":\"edit_file\", \"path\":\"main.py\", \"start_line\": 10, \"end_line\": 12}\n"
-            "```python\nprint(\"New\")\n```\n\n"
-            "Return exactly one valid action."
+            "前回の返答は無効でした。\n"
+            f"エラー: {error_message}\n"
+            f"前回の返答:\n{raw_response}\n\n"
+            "重要: Markdown記号（#や*）を使わず、プレーンテキストのみで回答してください。\n"
+            "次は必ず許可された形式の1つだけを返してください。\n"
+            "例1:\nGet-Content -Encoding UTF8 -Path .\\main.py, .\\tool_fs.py\n\n"
+            "例2:\neditFile path=.\\main.py\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n\n"
+            "例2の注意:\n- editFile の次の行は必ず <<<<<<< SEARCH にすること\n- Plaintext などの説明文を入れないこと\n- 空の SEARCH は先頭挿入を意味する\n\n"
+            "例3:\nfinal\n完了しました"
         )
 
     def _build_tool_result_prompt(self, action: AgentAction, result: dict[str, Any]) -> str:
         result_json = json.dumps(result, ensure_ascii=False)
         return (
-            "Tool result:\n"
+            "ツール実行結果:\n"
             f"action={action.action}\n"
             f"request={json.dumps(action.payload, ensure_ascii=False)}\n"
             f"result={result_json}\n\n"
-            "Choose the next single JSON action."
+            "重要: Markdown記号（#や*）を使わず、プレーンテキストのみで回答してください。\n"
+            "次に実行する1つの行動だけを、許可された形式で返してください。"
         )
 
     def _dispatch(self, action: AgentAction) -> dict[str, Any]:
@@ -158,85 +205,60 @@ class AgentLoop:
 
         if action.action == "edit_file":
             path = str(action.payload["path"])
-            start_line = int(action.payload.get("start_line", 1))
-            end_line = int(action.payload.get("end_line", start_line))
-            new_text = str(action.payload.get("new_text", ""))
-            
-            preview = self.fs_tools.preview_patch(path, start_line, end_line, new_text)
-            self._log(
-                f"dispatch edit_file path={path} target_lines={start_line}-{end_line} new_len={len(new_text)}"
-            )
+            instructions = str(action.payload.get("instructions", ""))
+            preview = self.fs_tools.preview_edit_instructions(path, instructions)
+            self._log(f"dispatch edit_file path={path} instruction_len={len(instructions)}")
             self.output_fn("\n--- diff preview ---")
             self.output_fn(preview["diff"] or "(no changes)")
             answer = self.input_fn("Apply this patch? [y/N]: ").strip().lower()
             if answer != "y":
                 return {"path": path, "applied": False, "reason": "user_rejected"}
-            applied = self.fs_tools.apply_patch(path, start_line, end_line, new_text)
+            applied = self.fs_tools.apply_edit_instructions(path, instructions)
             return {"path": path, "applied": True, "diff": applied["diff"]}
 
         raise ValueError(f"Unsupported action: {action.action}")
 
     def _parse_response(self, response_text: str) -> AgentAction:
-        json_text = self._extract_json_object(response_text)
-        self._log(f"json candidate: {self._preview_text(json_text, 1200)}")
-        payload = json.loads(json_text)
+        text = response_text.strip()
+        if not text:
+            raise ValueError("空の返答は無効です。")
 
-        if not isinstance(payload, dict):
-            raise ValueError("Response JSON must be an object.")
-        action = payload.get("action")
-        if action not in {"list_dir", "read_file", "edit_file", "run_shell", "final"}:
-            raise ValueError("Response contains an unknown action.")
-            
-        if action == "edit_file":
-            new_text_match = re.search(r"```(?:python|py|txt|json|html|css|js|ts)?\n?(.*?)\n?```", response_text[len(json_text):], re.DOTALL)
-            if new_text_match:
-                payload["new_text"] = new_text_match.group(1)
-            elif "new_text" not in payload:
-                raise ValueError("edit_file requires a Markdown code block outside the JSON.")
-            if "start_line" not in payload or "end_line" not in payload:
-                raise ValueError("edit_file requires start_line and end_line in JSON.")
+        final_match = re.match(r"^final\s*(?:\r?\n(?P<message>[\s\S]*))?$", text)
+        if final_match:
+            return AgentAction(
+                action="final",
+                payload={"message": (final_match.group("message") or "").strip()},
+            )
 
-        return AgentAction(action=action, payload=payload)
+        edit_match = re.match(r"^editFile\s+path=(?P<path>\S+)", text)
+        if edit_match:
+            block_match = re.search(r"```(?:text|python|py|txt)?\r?\n([\s\S]*?)\r?\n```", text)
+            instructions = block_match.group(1) if block_match else ""
+            if not instructions:
+                fallback_match = re.search(
+                    r"(?:(?:Plaintext|text|python|py|txt)\s+)?(<<<<<<< SEARCH[\s\S]*?>>>>>>> REPLACE)",
+                    text,
+                    re.IGNORECASE,
+                )
+                if fallback_match:
+                    instructions = fallback_match.group(1)
+            if not instructions:
+                raise ValueError("editFile には SEARCH/REPLACE ブロックが必要です。")
+            return AgentAction(
+                action="edit_file",
+                payload={
+                    "path": edit_match.group("path").strip(),
+                    "instructions": instructions,
+                },
+            )
 
-    def _extract_json_object(self, text: str) -> str:
-        fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if fenced_match:
-            return fenced_match.group(1)
-
-        start = text.find("{")
-        if start == -1:
-            raise ValueError("No JSON object found in response.")
-
-        depth = 0
-        in_string = False
-        escape = False
-        for index in range(start, len(text)):
-            char = text[index]
-            if in_string:
-                if escape:
-                    escape = False
-                elif char == "\\":
-                    escape = True
-                elif char == '"':
-                    in_string = False
-                continue
-
-            if char == '"':
-                in_string = True
-            elif char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start:index + 1]
-
-        raise ValueError("Incomplete JSON object in response.")
+        first_line = text.splitlines()[0].strip()
+        if len(text.splitlines()) > 1:
+            raise ValueError("コマンド応答は1行のみ、editFile または final は専用形式で返してください。")
+        return AgentAction(action="run_shell", payload={"command": first_line})
 
     def _log(self, message: str) -> None:
         self.output_fn(f"[agent-debug] {message}")
 
     def _preview_text(self, text: str, limit: int = 300) -> str:
-        normalized = " ".join(text.split())
-        if len(normalized) <= limit:
-            return normalized
-        return normalized[:limit] + "..."
+        return text

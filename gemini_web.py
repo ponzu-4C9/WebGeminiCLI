@@ -48,7 +48,9 @@ class GeminiWebClient:
         label = f"[{prompt_label}] " if prompt_label else ""
         print(f"\n{label}プロンプトを送信準備中...")
         print(f"{label}[debug] prompt_length={len(prompt)}")
-        print(f"{label}[debug] prompt_preview={self._preview_text(prompt)}")
+        print(f"{label}[debug] prompt_full_start")
+        print(prompt)
+        print(f"{label}[debug] prompt_full_end")
 
         print(f"{label}[debug] wait_for_input_box start")
         input_box = self._wait_for_input_box(timeout=30)
@@ -183,7 +185,9 @@ class GeminiWebClient:
                 else:
                     state = f"(生成停止確認中: {idle_count}/{self.completion_grace_seconds})"
                 print(f"  ... {elapsed}秒経過 {state} 現在の文字数: {len(last_text)}")
-                print(f"{label}[debug] latest_text_preview={self._preview_text(last_text)}")
+                print(f"{label}[debug] latest_text_full_start")
+                print(last_text)
+                print(f"{label}[debug] latest_text_full_end")
 
             time.sleep(1)
         else:
@@ -191,7 +195,9 @@ class GeminiWebClient:
 
         result = self._get_status()["text"] or last_text
         print(f"{label}応答取得完了 ({len(result)} 文字)")
-        print(f"{label}[debug] raw_response_preview={self._preview_text(result, limit=1200)}")
+        print(f"{label}[debug] raw_response_full_start")
+        print(result)
+        print(f"{label}[debug] raw_response_full_end")
         return result
 
     def _find_input_box(self) -> Optional[Any]:
@@ -218,10 +224,14 @@ class GeminiWebClient:
         status = self.driver.execute_script(
             """
             function getText(node) {
-                let text = "";
                 if (node.nodeType === Node.TEXT_NODE) {
-                    return node.textContent + " ";
+                    return node.textContent || "";
                 }
+                if (node.nodeType === Node.ELEMENT_NODE && node.nodeName === 'BR') {
+                    return "\\n";
+                }
+
+                let text = "";
                 if (node.shadowRoot) {
                     text += getText(node.shadowRoot);
                 }
@@ -233,13 +243,20 @@ class GeminiWebClient:
                         }
                     }
                 }
+
+                if (node.nodeType === Node.ELEMENT_NODE) {
+                    let blockTags = new Set(['P', 'DIV', 'PRE', 'CODE', 'LI', 'UL', 'OL']);
+                    if (blockTags.has(node.nodeName)) {
+                        text += "\\n";
+                    }
+                }
                 return text;
             }
 
             let messages = document.querySelectorAll('message-content');
             let latestText = '';
             if (messages.length > 0) {
-                latestText = getText(messages[messages.length - 1]).trim();
+                latestText = getText(messages[messages.length - 1]).replace(/\\n{3,}/g, "\\n\\n").trim();
             }
 
             let isGenerating = false;
@@ -261,7 +278,4 @@ class GeminiWebClient:
         }
 
     def _preview_text(self, text: str, limit: int = 300) -> str:
-        normalized = " ".join(text.split())
-        if len(normalized) <= limit:
-            return normalized
-        return normalized[:limit] + "..."
+        return text
